@@ -1,0 +1,22 @@
+[package]
+name = "wgsl_autogen"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wgsl_autogen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wgsl_autogen"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["dep:clap"]
+
+[dependencies]
+syn = { version = "2.0.117", features = ["full", "parsing", "visit"] }
+quote = "1.0.45"
+proc-macro2 = "1.0.106"
+clap = { version = "4", features = ["derive"], optional = true }
