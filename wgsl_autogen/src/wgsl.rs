@@ -30,6 +30,9 @@ fn rust_type_to_wgsl(ty: &RustType) -> String {
         RustType::Array(elem, size) => {
             format!("array<{}, {}>", rust_type_to_wgsl(elem), size)
         }
+        RustType::RuntimeArray(elem) => {
+            format!("array<{}>", rust_type_to_wgsl(elem))
+        }
     }
 }
 
@@ -68,6 +71,10 @@ fn wgsl_align_size(ty: &RustType, structs: &[ParsedStruct], enums: &[ParsedEnum]
             let (ea, es) = wgsl_align_size(elem, structs, enums);
             let stride = round_up(es, ea);
             (ea, stride * count)
+        }
+        RustType::RuntimeArray(elem) => {
+            let (ea, _) = wgsl_align_size(elem, structs, enums);
+            (ea, 0) // runtime-sized, no static size
         }
     }
 }
@@ -224,14 +231,22 @@ fn unpack_field_expr(
                 elems.join(", ")
             )
         }
+        RustType::RuntimeArray(_) => {
+            "/* runtime-sized array — cannot unpack statically */".to_string()
+        }
     }
 }
 
 fn generate_unpack_fns(enums: &[ParsedEnum], structs: &[ParsedStruct]) -> String {
     let mut output = String::new();
 
-    // Unpack functions for ShaderType structs
+    // Unpack functions for ShaderType structs (skip if has runtime-sized arrays)
     for s in structs {
+        let has_runtime = s.fields.iter().any(|(_, ty)| matches!(ty, RustType::RuntimeArray(_)));
+        if has_runtime {
+            continue;
+        }
+
         let (_, total_size) = struct_align_size(&s.fields, structs, enums);
         let vec4s = if total_size == 0 { 1 } else { (total_size + 15) / 16 };
 
@@ -292,6 +307,10 @@ fn dependency_names(fields: &[(String, RustType)]) -> Vec<String> {
         .iter()
         .filter_map(|(_, ty)| match ty {
             RustType::Named(name) => Some(name.clone()),
+            RustType::RuntimeArray(elem) => match elem.as_ref() {
+                RustType::Named(name) => Some(name.clone()),
+                _ => None,
+            },
             _ => None,
         })
         .collect()

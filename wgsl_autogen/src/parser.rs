@@ -24,6 +24,7 @@ pub enum RustType {
     Primitive(String),
     Named(String),
     Array(Box<RustType>, usize),
+    RuntimeArray(Box<RustType>),
 }
 
 fn has_derive(attrs: &[syn::Attribute], name: &str) -> bool {
@@ -49,7 +50,15 @@ fn parse_type(ty: &Type) -> RustType {
             let last = segments.last().unwrap();
             let name = last.ident.to_string();
 
-            // Check for array types like [T; N]
+            // Handle Vec<T> as a runtime-sized array
+            if name == "Vec" {
+                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        return RustType::RuntimeArray(Box::new(parse_type(inner)));
+                    }
+                }
+            }
+
             name_to_rust_type(&name)
         }
         Type::Array(arr) => {
@@ -167,6 +176,9 @@ fn resolve_type(ty: &RustType, aliases: &HashMap<String, RustType>) -> RustType 
         }
         RustType::Array(elem, size) => {
             RustType::Array(Box::new(resolve_type(elem, aliases)), *size)
+        }
+        RustType::RuntimeArray(elem) => {
+            RustType::RuntimeArray(Box::new(resolve_type(elem, aliases)))
         }
         _ => ty.clone(),
     }
