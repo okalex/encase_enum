@@ -33,51 +33,249 @@ fn rust_type_to_wgsl(ty: &RustType) -> String {
     }
 }
 
-/// Compute the WGSL size of a type in bytes (for encase layout estimation).
-fn wgsl_type_size(ty: &RustType, structs: &[ParsedStruct], enums: &[ParsedEnum]) -> usize {
+fn round_up(val: usize, align: usize) -> usize {
+    (val + align - 1) / align * align
+}
+
+/// Compute WGSL (align, size) for a type following the WGSL alignment spec.
+fn wgsl_align_size(ty: &RustType, structs: &[ParsedStruct], enums: &[ParsedEnum]) -> (usize, usize) {
     match ty {
         RustType::Primitive(name) => match name.as_str() {
-            "f32" | "u32" | "i32" | "bool" => 4,
-            "f64" => 8,
-            "u16" | "i16" => 4, // padded to 4 in WGSL
-            "Vec2" | "UVec2" | "IVec2" => 8,
-            "Vec3" | "UVec3" | "IVec3" => 12,
-            "Vec4" | "UVec4" | "IVec4" => 16,
-            "Mat2" => 16,  // 2 * vec2, but with padding: 2 * 8
-            "Mat3" => 48,  // 3 * vec3 padded to vec4 = 3 * 16
-            "Mat4" => 64,  // 4 * vec4
-            _ => 4,
+            "f32" | "u32" | "i32" | "bool" | "u16" | "i16" => (4, 4),
+            "f64" => (8, 8),
+            "Vec2" | "UVec2" | "IVec2" => (8, 8),
+            "Vec3" | "UVec3" | "IVec3" => (16, 12),
+            "Vec4" | "UVec4" | "IVec4" => (16, 16),
+            "Mat2" => (8, 16),   // 2 columns of vec2
+            "Mat3" => (16, 48),  // 3 columns of vec3 (each padded to 16)
+            "Mat4" => (16, 64),  // 4 columns of vec4
+            _ => (4, 4),
         },
         RustType::Named(name) => {
-            // Look up in structs
             if let Some(s) = structs.iter().find(|s| s.name == *name) {
-                struct_size(&s.fields, structs, enums)
+                struct_align_size(&s.fields, structs, enums)
             } else if let Some(e) = enums.iter().find(|e| e.name == *name) {
-                // ShaderEnum: material_type (u32) + data (vec4 array)
+                // Enum wrapper: { material_type: u32, data: array<vec4<f32>, N> }
+                // u32 at offset 0 (align 4), array at offset 16 (align 16)
                 let max = max_variant_size(&e.variants, structs, enums);
-                let vec4s = (max + 15) / 16;
-                4 + vec4s * 16 // u32 + array<vec4<f32>, N>
+                let vec4s = if max == 0 { 1 } else { (max + 15) / 16 };
+                (16, 16 + vec4s * 16)
             } else {
-                4 // fallback
+                (4, 4)
             }
         }
         RustType::Array(elem, count) => {
-            wgsl_type_size(elem, structs, enums) * count
+            let (ea, es) = wgsl_align_size(elem, structs, enums);
+            let stride = round_up(es, ea);
+            (ea, stride * count)
         }
     }
 }
 
-fn struct_size(fields: &[(String, RustType)], structs: &[ParsedStruct], enums: &[ParsedEnum]) -> usize {
-    // Simplified: sum of field sizes (encase handles alignment)
-    fields.iter().map(|(_, ty)| wgsl_type_size(ty, structs, enums)).sum()
+fn struct_align_size(
+    fields: &[(String, RustType)],
+    structs: &[ParsedStruct],
+    enums: &[ParsedEnum],
+) -> (usize, usize) {
+    let mut max_align = 1;
+    let mut offset = 0;
+    for (_, ty) in fields {
+        let (align, size) = wgsl_align_size(ty, structs, enums);
+        if align > max_align {
+            max_align = align;
+        }
+        offset = round_up(offset, align);
+        offset += size;
+    }
+    (max_align, round_up(offset, max_align))
 }
 
-fn max_variant_size(variants: &[ParsedVariant], structs: &[ParsedStruct], enums: &[ParsedEnum]) -> usize {
+fn max_variant_size(
+    variants: &[ParsedVariant],
+    structs: &[ParsedStruct],
+    enums: &[ParsedEnum],
+) -> usize {
     variants
         .iter()
-        .map(|v| struct_size(&v.fields, structs, enums))
+        .map(|v| {
+            let (_, size) = struct_align_size(&v.fields, structs, enums);
+            size
+        })
         .max()
         .unwrap_or(0)
+}
+
+// --- Unpack expression generation ---
+
+fn unpack_field_expr(
+    ty: &RustType,
+    data_var: &str,
+    offset: usize,
+    structs: &[ParsedStruct],
+    enums: &[ParsedEnum],
+) -> String {
+    match ty {
+        RustType::Primitive(name) => {
+            let vi = offset / 16;
+            let ci = (offset % 16) / 4;
+            let comp = ["x", "y", "z", "w"][ci];
+            match name.as_str() {
+                "f32" => format!("{data_var}[{vi}].{comp}"),
+                "u32" | "u16" | "i16" => format!("bitcast<u32>({data_var}[{vi}].{comp})"),
+                "i32" => format!("bitcast<i32>({data_var}[{vi}].{comp})"),
+                "bool" => format!("(bitcast<u32>({data_var}[{vi}].{comp}) != 0u)"),
+                "Vec2" => {
+                    let comps = if ci == 0 { "xy" } else { "zw" };
+                    format!("{data_var}[{vi}].{comps}")
+                }
+                "UVec2" => {
+                    let comps = if ci == 0 { "xy" } else { "zw" };
+                    format!("bitcast<vec2<u32>>({data_var}[{vi}].{comps})")
+                }
+                "IVec2" => {
+                    let comps = if ci == 0 { "xy" } else { "zw" };
+                    format!("bitcast<vec2<i32>>({data_var}[{vi}].{comps})")
+                }
+                "Vec3" => format!("{data_var}[{vi}].xyz"),
+                "UVec3" => format!("bitcast<vec3<u32>>({data_var}[{vi}].xyz)"),
+                "IVec3" => format!("bitcast<vec3<i32>>({data_var}[{vi}].xyz)"),
+                "Vec4" => format!("{data_var}[{vi}]"),
+                "UVec4" => format!("bitcast<vec4<u32>>({data_var}[{vi}])"),
+                "IVec4" => format!("bitcast<vec4<i32>>({data_var}[{vi}])"),
+                "Mat2" => {
+                    let c0 = if ci == 0 {
+                        format!("{data_var}[{vi}].xy")
+                    } else {
+                        format!("{data_var}[{vi}].zw")
+                    };
+                    let c1_offset = offset + 8;
+                    let c1_vi = c1_offset / 16;
+                    let c1_ci = (c1_offset % 16) / 4;
+                    let c1 = if c1_ci == 0 {
+                        format!("{data_var}[{c1_vi}].xy")
+                    } else {
+                        format!("{data_var}[{c1_vi}].zw")
+                    };
+                    format!("mat2x2<f32>({c0}, {c1})")
+                }
+                "Mat3" => {
+                    format!(
+                        "mat3x3<f32>({data_var}[{vi}].xyz, {data_var}[{}].xyz, {data_var}[{}].xyz)",
+                        vi + 1,
+                        vi + 2
+                    )
+                }
+                "Mat4" => {
+                    format!(
+                        "mat4x4<f32>({data_var}[{vi}], {data_var}[{}], {data_var}[{}], {data_var}[{}])",
+                        vi + 1,
+                        vi + 2,
+                        vi + 3
+                    )
+                }
+                _ => format!("{data_var}[{vi}].{comp}"),
+            }
+        }
+        RustType::Named(name) => {
+            if let Some(s) = structs.iter().find(|s| s.name == *name) {
+                let mut args = Vec::new();
+                let mut field_offset = offset;
+                for (_, field_ty) in &s.fields {
+                    let (align, size) = wgsl_align_size(field_ty, structs, enums);
+                    field_offset = round_up(field_offset, align);
+                    args.push(unpack_field_expr(field_ty, data_var, field_offset, structs, enums));
+                    field_offset += size;
+                }
+                format!("{}({})", name, args.join(", "))
+            } else if let Some(e) = enums.iter().find(|e| e.name == *name) {
+                // Nested enum: { material_type: u32 at offset, data: array<vec4, N> at round_up(offset+4, 16) }
+                let max = max_variant_size(&e.variants, structs, enums);
+                let vec4s = if max == 0 { 1 } else { (max + 15) / 16 };
+                let mt_vi = offset / 16;
+                let mt_ci = (offset % 16) / 4;
+                let mt_comp = ["x", "y", "z", "w"][mt_ci];
+                let mt_expr = format!("bitcast<u32>({data_var}[{mt_vi}].{mt_comp})");
+                let data_offset = round_up(offset + 4, 16);
+                let data_vi = data_offset / 16;
+                let inner: Vec<String> = (0..vec4s)
+                    .map(|i| format!("{data_var}[{}]", data_vi + i))
+                    .collect();
+                format!(
+                    "{}({}, array<vec4<f32>, {}>({}))",
+                    name,
+                    mt_expr,
+                    vec4s,
+                    inner.join(", ")
+                )
+            } else {
+                format!("/* unknown type: {} */", name)
+            }
+        }
+        RustType::Array(elem, count) => {
+            let (ea, es) = wgsl_align_size(elem, structs, enums);
+            let stride = round_up(es, ea);
+            let elems: Vec<String> = (0..*count)
+                .map(|i| unpack_field_expr(elem, data_var, offset + i * stride, structs, enums))
+                .collect();
+            format!(
+                "array<{}, {}>({})",
+                rust_type_to_wgsl(elem),
+                count,
+                elems.join(", ")
+            )
+        }
+    }
+}
+
+fn generate_unpack_fns(enums: &[ParsedEnum], structs: &[ParsedStruct]) -> String {
+    let mut output = String::new();
+
+    // Unpack functions for ShaderType structs
+    for s in structs {
+        let (_, total_size) = struct_align_size(&s.fields, structs, enums);
+        let vec4s = if total_size == 0 { 1 } else { (total_size + 15) / 16 };
+
+        let mut args = Vec::new();
+        let mut offset = 0usize;
+        for (_, ty) in &s.fields {
+            let (align, size) = wgsl_align_size(ty, structs, enums);
+            offset = round_up(offset, align);
+            args.push(unpack_field_expr(ty, "data", offset, structs, enums));
+            offset += size;
+        }
+
+        output.push_str(&format!(
+            "fn unpack_{}(data: array<vec4<f32>, {}>) -> {} {{\n    return {}({});\n}}\n\n",
+            s.name, vec4s, s.name, s.name, args.join(", ")
+        ));
+    }
+
+    // Unpack functions for enum variants
+    for e in enums {
+        for variant in &e.variants {
+            if variant.fields.is_empty() {
+                continue;
+            }
+            let fn_name = format!("unpack_{}_{}", e.name, variant.name);
+            let wrapper_name = &e.name;
+            let data_name = format!("{}{}Data", e.name, variant.name);
+
+            let mut args = Vec::new();
+            let mut offset = 0usize;
+            for (_, ty) in &variant.fields {
+                let (align, size) = wgsl_align_size(ty, structs, enums);
+                offset = round_up(offset, align);
+                args.push(unpack_field_expr(ty, "v.data", offset, structs, enums));
+                offset += size;
+            }
+
+            output.push_str(&format!(
+                "fn {}(v: {}) -> {} {{\n    return {}({});\n}}\n\n",
+                fn_name, wrapper_name, data_name, data_name, args.join(", ")
+            ));
+        }
+    }
+    output
 }
 
 fn generate_struct_wgsl(name: &str, fields: &[(String, RustType)]) -> String {
@@ -136,7 +334,7 @@ fn topo_sort(
     result
 }
 
-pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum]) -> String {
+pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum], define_import_path: bool) -> String {
     let mut definitions: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut deps: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let mut all_names: Vec<String> = Vec::new();
@@ -198,6 +396,9 @@ pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum]) -> String {
     // Topologically sort and output
     let sorted = topo_sort(&all_names, &deps);
     let mut output = String::new();
+    if define_import_path {
+        output.push_str("#define_import_path types\n\n");
+    }
     output.push_str("// Auto-generated by wgsl_autogen — do not edit\n\n");
     for (i, name) in sorted.iter().enumerate() {
         if let Some(def) = definitions.get(name) {
@@ -207,6 +408,14 @@ pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum]) -> String {
             output.push_str(def);
         }
     }
+
+    // Generate unpack functions
+    let unpack = generate_unpack_fns(enums, structs);
+    if !unpack.is_empty() {
+        output.push_str("\n\n");
+        output.push_str(&unpack.trim_end());
+    }
+
     output.push('\n');
     output
 }

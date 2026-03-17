@@ -14,12 +14,16 @@ struct Cli {
     /// Output WGSL file path
     #[arg(short, long)]
     output: PathBuf,
+
+    /// Add a naga-oil compatible #define_import_path directive
+    #[arg(long)]
+    define_import_path: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let wgsl = match wgsl_autogen::generate_wgsl_from_files(&cli.input) {
+    let wgsl = match wgsl_autogen::generate_wgsl_from_files(&cli.input, cli.define_import_path) {
         Ok(wgsl) => wgsl,
         Err(e) => {
             eprintln!("Error: {}", e);

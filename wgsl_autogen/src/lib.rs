@@ -36,7 +36,7 @@ fn walkdir(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Scan Rust source files and generate WGSL type definitions.
-pub fn generate_wgsl_from_files(paths: &[PathBuf]) -> Result<String, String> {
+pub fn generate_wgsl_from_files(paths: &[PathBuf], define_import_path: bool) -> Result<String, String> {
     let files = collect_rust_files(paths);
 
     if files.is_empty() {
@@ -60,5 +60,5 @@ pub fn generate_wgsl_from_files(paths: &[PathBuf]) -> Result<String, String> {
 
     parser::resolve_aliases(&mut structs, &mut enums, &aliases);
 
-    Ok(wgsl::generate_wgsl(&structs, &enums))
+    Ok(wgsl::generate_wgsl(&structs, &enums, define_import_path))
 }
