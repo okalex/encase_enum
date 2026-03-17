@@ -1,6 +1,6 @@
 # encase_enum
 
-**⚠️ Not recommended for production use.** This is an experimental project and its API is subject to change without notice. Also, this was just vibe-coded to solve a problem in a different project, since I'm new to rust and haven't done any macro programming just yet. Buyer beward.
+**⚠️ Not recommended for production use.** This is an experimental project and its API is subject to change without notice. Also, this was just vibe-coded to solve a problem in a different project, since I'm new to rust and haven't done any macro programming just yet. Buyer beware.
 
 `encase_enum` adds enum support to [encase](https://crates.io/crates/encase), allowing Rust enums to be serialized into GPU buffers as tagged unions. It also includes a companion tool for generating WGSL type definitions from Rust source files.
 
