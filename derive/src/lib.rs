@@ -77,9 +77,11 @@ pub fn derive_encase_enum(input: TokenStream) -> TokenStream {
                     let field_names: Vec<_> =
                         f.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
                     let field_types: Vec<_> = f.named.iter().map(|f| &f.ty).collect();
-                    let writes = field_names.iter().zip(field_types.iter()).map(|(ident, ty)| {
+                    let writes = field_names.iter().zip(field_types.iter()).enumerate().map(|(idx, (ident, ty))| {
+                        let idx = syn::Index::from(idx);
                         quote! {
                             <#ty as encase::internal::WriteInto>::write_into(#ident, &mut writer);
+                            writer.advance(<#vs_ident as encase::ShaderType>::METADATA.padding(#idx) as usize);
                         }
                     });
                     (quote! { { #(#field_names,)* } }, quote! { #(#writes)* })
@@ -89,9 +91,11 @@ pub fn derive_encase_enum(input: TokenStream) -> TokenStream {
                         .map(|i| syn::Ident::new(&format!("field{}", i), enum_name.span()))
                         .collect();
                     let field_types: Vec<_> = f.unnamed.iter().map(|f| &f.ty).collect();
-                    let writes = field_names.iter().zip(field_types.iter()).map(|(ident, ty)| {
+                    let writes = field_names.iter().zip(field_types.iter()).enumerate().map(|(idx, (ident, ty))| {
+                        let idx = syn::Index::from(idx);
                         quote! {
                             <#ty as encase::internal::WriteInto>::write_into(#ident, &mut writer);
+                            writer.advance(<#vs_ident as encase::ShaderType>::METADATA.padding(#idx) as usize);
                         }
                     });
                     (quote! { (#(#field_names,)*) }, quote! { #(#writes)* })

@@ -41,7 +41,11 @@ fn round_up(val: usize, align: usize) -> usize {
 }
 
 /// Compute WGSL (align, size) for a type following the WGSL alignment spec.
-fn wgsl_align_size(ty: &RustType, structs: &[ParsedStruct], enums: &[ParsedEnum]) -> (usize, usize) {
+fn wgsl_align_size(
+    ty: &RustType,
+    structs: &[ParsedStruct],
+    enums: &[ParsedEnum],
+) -> (usize, usize) {
     match ty {
         RustType::Primitive(name) => match name.as_str() {
             "f32" | "u32" | "i32" | "bool" | "u16" | "i16" => (4, 4),
@@ -49,16 +53,16 @@ fn wgsl_align_size(ty: &RustType, structs: &[ParsedStruct], enums: &[ParsedEnum]
             "Vec2" | "UVec2" | "IVec2" => (8, 8),
             "Vec3" | "UVec3" | "IVec3" => (16, 12),
             "Vec4" | "UVec4" | "IVec4" => (16, 16),
-            "Mat2" => (8, 16),   // 2 columns of vec2
-            "Mat3" => (16, 48),  // 3 columns of vec3 (each padded to 16)
-            "Mat4" => (16, 64),  // 4 columns of vec4
+            "Mat2" => (8, 16),  // 2 columns of vec2
+            "Mat3" => (16, 48), // 3 columns of vec3 (each padded to 16)
+            "Mat4" => (16, 64), // 4 columns of vec4
             _ => (4, 4),
         },
         RustType::Named(name) => {
             if let Some(s) = structs.iter().find(|s| s.name == *name) {
                 struct_align_size(&s.fields, structs, enums)
             } else if let Some(e) = enums.iter().find(|e| e.name == *name) {
-                // Enum wrapper: { material_type: u32, data: array<vec4<f32>, N> }
+                // Enum wrapper: { _type: u32, data: array<vec4<f32>, N> }
                 // u32 at offset 0 (align 4), array at offset 16 (align 16)
                 let max = max_variant_size(&e.variants, structs, enums);
                 let vec4s = if max == 0 { 1 } else { (max + 15) / 16 };
@@ -190,12 +194,18 @@ fn unpack_field_expr(
                 for (_, field_ty) in &s.fields {
                     let (align, size) = wgsl_align_size(field_ty, structs, enums);
                     field_offset = round_up(field_offset, align);
-                    args.push(unpack_field_expr(field_ty, data_var, field_offset, structs, enums));
+                    args.push(unpack_field_expr(
+                        field_ty,
+                        data_var,
+                        field_offset,
+                        structs,
+                        enums,
+                    ));
                     field_offset += size;
                 }
                 format!("{}({})", name, args.join(", "))
             } else if let Some(e) = enums.iter().find(|e| e.name == *name) {
-                // Nested enum: { material_type: u32 at offset, data: array<vec4, N> at round_up(offset+4, 16) }
+                // Nested enum: { _type: u32 at offset, data: array<vec4, N> at round_up(offset+4, 16) }
                 let max = max_variant_size(&e.variants, structs, enums);
                 let vec4s = if max == 0 { 1 } else { (max + 15) / 16 };
                 let mt_vi = offset / 16;
@@ -242,13 +252,20 @@ fn generate_unpack_fns(enums: &[ParsedEnum], structs: &[ParsedStruct]) -> String
 
     // Unpack functions for ShaderType structs (skip if has runtime-sized arrays)
     for s in structs {
-        let has_runtime = s.fields.iter().any(|(_, ty)| matches!(ty, RustType::RuntimeArray(_)));
+        let has_runtime = s
+            .fields
+            .iter()
+            .any(|(_, ty)| matches!(ty, RustType::RuntimeArray(_)));
         if has_runtime {
             continue;
         }
 
         let (_, total_size) = struct_align_size(&s.fields, structs, enums);
-        let vec4s = if total_size == 0 { 1 } else { (total_size + 15) / 16 };
+        let vec4s = if total_size == 0 {
+            1
+        } else {
+            (total_size + 15) / 16
+        };
 
         let mut args = Vec::new();
         let mut offset = 0usize;
@@ -261,7 +278,11 @@ fn generate_unpack_fns(enums: &[ParsedEnum], structs: &[ParsedStruct]) -> String
 
         output.push_str(&format!(
             "fn unpack_{}(data: array<vec4<f32>, {}>) -> {} {{\n    return {}({});\n}}\n\n",
-            s.name, vec4s, s.name, s.name, args.join(", ")
+            s.name,
+            vec4s,
+            s.name,
+            s.name,
+            args.join(", ")
         ));
     }
 
@@ -273,7 +294,7 @@ fn generate_unpack_fns(enums: &[ParsedEnum], structs: &[ParsedStruct]) -> String
             }
             let fn_name = format!("unpack_{}_{}", e.name, variant.name);
             let wrapper_name = &e.name;
-            let data_name = format!("{}{}Data", e.name, variant.name);
+            let data_name = format!("{}_{}", e.name, variant.name);
 
             let mut args = Vec::new();
             let mut offset = 0usize;
@@ -286,7 +307,11 @@ fn generate_unpack_fns(enums: &[ParsedEnum], structs: &[ParsedStruct]) -> String
 
             output.push_str(&format!(
                 "fn {}(v: {}) -> {} {{\n    return {}({});\n}}\n\n",
-                fn_name, wrapper_name, data_name, data_name, args.join(", ")
+                fn_name,
+                wrapper_name,
+                data_name,
+                data_name,
+                args.join(", ")
             ));
         }
     }
@@ -353,8 +378,13 @@ fn topo_sort(
     result
 }
 
-pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum], define_import_path: bool) -> String {
-    let mut definitions: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+pub fn generate_wgsl(
+    structs: &[ParsedStruct],
+    enums: &[ParsedEnum],
+    define_import_path: bool,
+) -> String {
+    let mut definitions: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut deps: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let mut all_names: Vec<String> = Vec::new();
 
@@ -375,7 +405,7 @@ pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum], define_impo
         // Variant data structs
         for variant in e.variants.iter() {
             if !variant.fields.is_empty() {
-                let vs_name = format!("{}{}Data", e.name, variant.name);
+                let vs_name = format!("{}_{}", e.name, variant.name);
                 let wgsl = generate_struct_wgsl(&vs_name, &variant.fields);
                 let dep_names = dependency_names(&variant.fields);
                 enum_deps.extend(dep_names.clone());
@@ -401,8 +431,12 @@ pub fn generate_wgsl(structs: &[ParsedStruct], enums: &[ParsedEnum], define_impo
         let max = max_variant_size(&e.variants, structs, enums);
         let vec4s = if max == 0 { 1 } else { (max + 15) / 16 };
         let wrapper_wgsl = format!(
-            "{}struct {} {{\n    material_type: u32,\n    data: array<vec4<f32>, {}>,\n}}",
-            if const_block.is_empty() { String::new() } else { format!("{}\n", const_block) },
+            "{}struct {} {{\n    _type: u32,\n    data: array<vec4<f32>, {}>,\n}}",
+            if const_block.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", const_block)
+            },
             wrapper_name,
             vec4s
         );
